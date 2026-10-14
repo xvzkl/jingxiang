@@ -1,2 +1,2 @@
 --platform linux/arm64 php:8.4-fpm-alpine
-alpine:latest
+--platform linux/arm64 alpine:latest
