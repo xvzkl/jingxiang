@@ -1,3 +1,4 @@
 php:8.3-fpm
 php:8.4-fpm
 php:8.4.26
+php:8.4-fpm-alpine
