@@ -97,7 +97,7 @@ jobs:
             if [ -z "$platform" ]; then
                 # 未指定架构 => 整镜像多架构原样拷贝（保留 manifest list）
                 echo ">>> Multi-arch copy (--all)"
-                skopeo copy --all --retry-times 3 \
+                skopeo copy --all --format v2s2 --retry-times 3 \
                     docker://$image \
                     docker://$new_image
             else
@@ -107,12 +107,12 @@ jobs:
                 variant=$(echo "$platform" | cut -d'/' -f3)
                 echo ">>> Single-arch copy os=$os arch=$arch variant=[$variant]"
                 if [ -n "$variant" ]; then
-                    skopeo copy --retry-times 3 \
+                    skopeo copy --format v2s2 --retry-times 3 \
                         --override-os "$os" --override-arch "$arch" --override-variant "$variant" \
                         docker://$image \
                         docker://$new_image
                 else
-                    skopeo copy --retry-times 3 \
+                    skopeo copy --format v2s2 --retry-times 3 \
                         --override-os "$os" --override-arch "$arch" \
                         docker://$image \
                         docker://$new_image
