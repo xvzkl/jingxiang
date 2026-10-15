@@ -1,3 +1,4 @@
 --platform linux/arm64 php:8.4-fpm-alpine
 --platform linux/arm64 alpine:latest
 1panel/openresty:1.31.1.1-2-4-noble
+hub.1panel.dev/openresty/openresty:1.31.1.1-2-4-noble
