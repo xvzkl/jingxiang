@@ -3,3 +3,4 @@ alpine:latest
 1panel/openresty:1.31.1.1-2-4-noble
 ddsderek/easyimage:latest
 1panel-php-fpm:8.5.11
+1panel/php:8.5.11-fpm
