@@ -15,7 +15,7 @@ env:
 jobs:
 
   build:
-    name: Pull
+    name: Sync
     runs-on: ubuntu-latest
     steps:
     - name: Checkout Code
@@ -25,12 +25,18 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y skopeo
+        skopeo --version
 
     - name: Sync images to Aliyun
       run: |
         set -e
-        # 登录阿里云仓库
+        # 允许使用实验性命令（docker manifest）
+        export DOCKER_CLI_EXPERIMENTAL=enabled
+
+        # 登录阿里云仓库（skopeo 用）
         skopeo login -u "$ALIYUN_REGISTRY_USER" -p "$ALIYUN_REGISTRY_PASSWORD" "$ALIYUN_REGISTRY"
+        # 登录阿里云仓库（docker 用，manifest 需要）
+        echo "$ALIYUN_REGISTRY_PASSWORD" | docker login -u "$ALIYUN_REGISTRY_USER" --password-stdin "$ALIYUN_REGISTRY"
 
         # ========== 数据预处理：判断镜像是否重名 ==========
         declare -A duplicate_images
@@ -65,14 +71,6 @@ jobs:
 
             # 解析 --platform 参数（支持 --platform=xxx 和 --platform xxx）
             platform=$(echo "$line" | sed -n 's/.*--platform[ =]\([^ ]*\).*/\1/p')
-            echo "platform is [$platform]"
-
-            if [ -z "$platform" ]; then
-                platform_prefix=""
-            else
-                platform_prefix="${platform//\//_}_"
-            fi
-            echo "platform_prefix is [$platform_prefix]"
 
             image=$(echo "$line" | awk '{print $NF}')
             image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
@@ -87,49 +85,97 @@ jobs:
             fi
 
             image_name_tag="${image_name_tag%%@*}"
-            new_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$platform_prefix$name_space_prefix$image_name_tag"
+            base_name="$ALIYUN_NAME_SPACE/${name_space_prefix}${image_name_tag}"
 
             echo "==================================================================="
             echo "SOURCE : docker://$image"
-            echo "TARGET : docker://$new_image"
+            echo "PLATFORM: [${platform}]"
             echo "==================================================================="
 
-            if [ -z "$platform" ]; then
-                # 未指定架构 => 整镜像多架构原样拷贝（保留 manifest list）
-                echo ">>> Multi-arch copy (--all)"
-                skopeo copy --all --format v2s2 --retry-times 3 \
-                    docker://$image \
-                    docker://$new_image
-            else
-                # 指定架构 => 只拷贝该架构，架构信息被完整保留
+            if [ -n "$platform" ]; then
+                # ---------- 指定架构：只拷该架构（原逻辑，最稳） ----------
                 os=$(echo "$platform" | cut -d'/' -f1)
                 arch=$(echo "$platform" | cut -d'/' -f2)
                 variant=$(echo "$platform" | cut -d'/' -f3)
+                platform_prefix="${platform//\//_}_"
+                new_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/${platform_prefix}${name_space_prefix}${image_name_tag}"
+
                 echo ">>> Single-arch copy os=$os arch=$arch variant=[$variant]"
+                echo "TARGET : docker://$new_image"
                 if [ -n "$variant" ]; then
                     skopeo copy --format v2s2 --retry-times 3 \
                         --override-os "$os" --override-arch "$arch" --override-variant "$variant" \
-                        docker://$image \
-                        docker://$new_image
+                        docker://$image docker://$new_image
                 else
                     skopeo copy --format v2s2 --retry-times 3 \
                         --override-os "$os" --override-arch "$arch" \
-                        docker://$image \
-                        docker://$new_image
+                        docker://$image docker://$new_image
+                fi
+
+            else
+                # ---------- 未指定架构：多架构（amd64 + arm64）自动 fallback ----------
+                target="$ALIYUN_REGISTRY/$base_name"
+
+                # 1) 分别拷贝 amd64 / arm64 到临时 tag
+                ok_amd64=true
+                ok_arm64=true
+                echo ">>> Copy amd64 -> ${target}-amd64"
+                skopeo copy --format v2s2 --retry-times 3 \
+                    --override-os linux --override-arch amd64 \
+                    docker://$image docker://${target}-amd64 || ok_amd64=false
+
+                echo ">>> Copy arm64 -> ${target}-arm64"
+                skopeo copy --format v2s2 --retry-times 3 \
+                    --override-os linux --override-arch arm64 \
+                    docker://$image docker://${target}-arm64 || ok_arm64=false
+
+                # 2) 尝试合并多架构 manifest
+                manifest_ok=false
+                if [ "$ok_amd64" = "true" ] && [ "$ok_arm64" = "true" ]; then
+                    echo ">>> Try create multi-arch manifest: $target"
+                    if docker manifest create "$target" \
+                            "${target}-amd64" \
+                            "${target}-arm64"; then
+                        if docker manifest push "$target"; then
+                            manifest_ok=true
+                        fi
+                    fi
+                fi
+
+                # 3) 结果汇总 / fallback
+                if [ "$manifest_ok" = "true" ]; then
+                    echo ">>> RESULT: multi-arch OK -> $target (amd64, arm64)"
+                    echo ">>> Cleanup temp tags"
+                    docker manifest rm "${target}-amd64" 2>/dev/null || true
+                    docker manifest rm "${target}-arm64" 2>/dev/null || true
+                else
+                    echo ">>> RESULT: multi-arch FAILED, fallback to dual-tag"
+                    [ "$ok_amd64" = "true" ] && echo "    kept: ${target}-amd64"
+                    [ "$ok_arm64" = "true" ] && echo "    kept: ${target}-arm64"
                 fi
             fi
 
             # ========== 校验目标架构 ==========
             echo ">>> verify destination:"
-            raw=$(skopeo inspect --raw "docker://$new_image" 2>/dev/null || echo "")
-            if echo "$raw" | grep -q '"manifests"'; then
-                archs=$(echo "$raw" | grep -o '"architecture":"[^"]*"' | sed 's/"architecture":"//;s/"//g' | paste -sd, -)
-                echo "  RESULT: multi-arch manifest list, architectures = [$archs]"
-            elif [ -n "$raw" ]; then
-                arch=$(echo "$raw" | grep -o '"architecture":"[^"]*"' | head -1 | sed 's/"architecture":"//;s/"//g')
-                echo "  RESULT: single-arch, architecture = [$arch]"
+            if [ -n "$platform" ]; then
+                raw=$(skopeo inspect --raw "docker://$new_image" 2>/dev/null || echo "")
+                if echo "$raw" | grep -q '"manifests"'; then
+                    archs=$(echo "$raw" | grep -o '"architecture":"[^"]*"' | sed 's/"architecture":"//;s/"//g' | paste -sd, -)
+                    echo "  RESULT: multi-arch, architectures = [$archs]"
+                elif [ -n "$raw" ]; then
+                    arch=$(echo "$raw" | grep -o '"architecture":"[^"]*"' | head -1 | sed 's/"architecture":"//;s/"//g')
+                    echo "  RESULT: single-arch, architecture = [$arch]"
+                else
+                    echo "  RESULT: verify skipped"
+                fi
             else
-                echo "  RESULT: verify skipped (inspect failed)"
+                raw=$(skopeo inspect --raw "docker://$target" 2>/dev/null || echo "")
+                if echo "$raw" | grep -q '"manifests"'; then
+                    archs=$(echo "$raw" | grep -o '"architecture":"[^"]*"' | sed 's/"architecture":"//;s/"//g' | paste -sd, -)
+                    echo "  RESULT: multi-arch manifest, architectures = [$archs]"
+                else
+                    echo "  RESULT: dual-tag fallback (${target}-amd64 / ${target}-arm64)"
+                fi
             fi
             echo "==================================================================="
             echo ""
