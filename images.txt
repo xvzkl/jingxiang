@@ -4,3 +4,4 @@ alpine:latest
 ddsderek/easyimage:latest
 1panel-php-fpm:8.5.11
 1panel/php:8.5.11-fpm
+1panel/node:25.9.0
